@@ -272,57 +272,151 @@ def generation_all(
     )
     path = export_mesh(mesh, save_folder, textured=False)
 
+    # Save a copy of the image for texturing
+    if not MV_MODE:
+        input_image = image
+    else:
+        input_image = image['front']
+    image_path = os.path.join(save_folder, "reference_image.png")
+    input_image.save(image_path)
+
     tmp_time = time.time()
     mesh = face_reduce_worker(mesh)
     logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['face reduction'] = time.time() - tmp_time
 
-    # Modified texture generation code
+    # Improved texture generation code
     tmp_time = time.time()
+    textured_mesh = None
     try:
-        # Try different approaches to generate texture
-        render_obj = texgen_worker.render
-        render_methods = [m for m in dir(render_obj) if not m.startswith('_')]
-        logger.info(f"Available methods on render object: {render_methods}")
+        logger.info("Starting texture generation...")
         
-        # Check if we have models that might help
-        if hasattr(texgen_worker, 'models'):
-            for model_name, model in texgen_worker.models.items():
-                if hasattr(model, 'process') and callable(getattr(model, 'process')):
-                    logger.info(f"Using {model_name}.process for texturing")
-                    textured_mesh = model.process(mesh, image)
-                    break
-                elif hasattr(model, 'apply_texture') and callable(getattr(model, 'apply_texture')):
-                    logger.info(f"Using {model_name}.apply_texture for texturing")
-                    textured_mesh = model.apply_texture(mesh, image)
-                    break
-                elif hasattr(model, '__call__') and callable(getattr(model, '__call__')):
-                    logger.info(f"Calling {model_name} directly for texturing")
-                    textured_mesh = model(mesh, image)
-                    break
-            else:
-                # No suitable model method found, try the render attribute
-                for method_name in ['apply', 'process', 'generate', 'texture', 'render_texture']:
-                    if hasattr(render_obj, method_name) and callable(getattr(render_obj, method_name)):
-                        logger.info(f"Using render.{method_name} for texturing")
-                        textured_mesh = getattr(render_obj, method_name)(mesh, image)
-                        break
-                else:
-                    # As a last resort, check if there's a method directly on texgen_worker
-                    for method_name in ['render_texture', 'apply_texture', 'generate_texture']:
-                        if hasattr(texgen_worker, method_name) and callable(getattr(texgen_worker, method_name)):
-                            logger.info(f"Using texgen_worker.{method_name} for texturing")
-                            textured_mesh = getattr(texgen_worker, method_name)(mesh, image)
-                            break
+        # Get the render object which has all the texture methods
+        render_obj = texgen_worker.render
+        
+        # First, make sure we have a mesh with UV coordinates
+        logger.info("Setting up mesh for texturing...")
+        
+        # Set the mesh in the render object
+        render_obj.set_mesh(mesh)
+        
+        # We need to try multiple approaches
+        approaches = [
+            {
+                "name": "Bake texture directly",
+                "func": lambda: render_obj.bake_texture()
+            },
+            {
+                "name": "Set texture then bake",
+                "func": lambda: (render_obj.set_texture(input_image), render_obj.bake_texture())
+            },
+            {
+                "name": "Fast bake texture",
+                "func": lambda: render_obj.fast_bake_texture()
+            },
+            {
+                "name": "Render and get mesh",
+                "func": lambda: (render_obj.render(), render_obj.get_mesh())
+            },
+            {
+                "name": "Using multiview_model",
+                "func": lambda: texgen_worker.models['multiview_model'].process(mesh, input_image) 
+                              if 'multiview_model' in texgen_worker.models else None
+            }
+        ]
+        
+        # Try each approach until one works
+        for approach in approaches:
+            try:
+                logger.info(f"Trying texture approach: {approach['name']}")
+                result = approach["func"]()
+                # If the result is not None and seems valid, use it
+                if result is not None:
+                    if isinstance(result, tuple):
+                        # Some functions return multiple values, get the last one which is likely the mesh
+                        textured_mesh = result[-1]
                     else:
-                        # Try the default method last
-                        logger.info("Trying default texgen_worker call")
-                        textured_mesh = texgen_worker(mesh, image)
-        else:
-            # If no models, try calling texgen_worker directly
-            logger.info("No models attribute, calling texgen_worker directly")
-            textured_mesh = texgen_worker(mesh, image)
+                        textured_mesh = result
+                    
+                    # If we got a valid mesh, break out of the loop
+                    if isinstance(textured_mesh, trimesh.Trimesh) and hasattr(textured_mesh, 'visual') and textured_mesh.visual.defined:
+                        logger.info(f"Success with approach: {approach['name']}")
+                        break
+            except Exception as e:
+                logger.info(f"Error with approach {approach['name']}: {e}")
+        
+        # If no approach worked, create a colored mesh using vertex colors
+        if textured_mesh is None or not hasattr(textured_mesh, 'visual') or not textured_mesh.visual.defined:
+            logger.info("No texture approaches worked, creating basic colored mesh")
+            # Create a simple colored mesh by assigning vertex colors
+            textured_mesh = mesh.copy()
             
+            # Create vertex colors from the image
+            try:
+                import numpy as np
+                from PIL import Image
+                
+                # Project vertices to image space for vertex coloring
+                def project_vertices_to_image(vertices, image_size):
+                    # Normalize the mesh to fit within the image
+                    min_coords = np.min(vertices, axis=0)
+                    max_coords = np.max(vertices, axis=0)
+                    
+                    # Calculate center of the mesh
+                    center = (min_coords + max_coords) / 2
+                    
+                    # Center the mesh
+                    centered = vertices - center
+                    
+                    # Calculate scale to fit within image
+                    scale = max(max_coords - min_coords)
+                    if scale == 0:
+                        scale = 1.0
+                    
+                    # Scale down slightly to have some border
+                    scale *= 1.1
+                    
+                    # Scale the vertices to fit in a -0.5 to 0.5 range
+                    normalized = centered / scale
+                    
+                    # Convert to image coordinates (x right, y down)
+                    # Only use x and y coordinates for a front view
+                    width, height = image_size
+                    
+                    # Map x from -0.5...0.5 to 0...width
+                    img_x = (normalized[:, 0] + 0.5) * width
+                    
+                    # Map y from -0.5...0.5 to 0...height, flip y because image coordinates go down
+                    img_y = (0.5 - normalized[:, 1]) * height
+                    
+                    # Return as int coords
+                    return np.column_stack([img_x, img_y]).astype(int)
+                
+                # Apply vertex colors from the image
+                img_array = np.array(input_image)
+                width, height = input_image.size
+                vertices = textured_mesh.vertices
+                
+                # Project vertices to image space
+                img_coords = project_vertices_to_image(vertices, (width, height))
+                
+                # Clamp coordinates to image bounds
+                img_coords[:, 0] = np.clip(img_coords[:, 0], 0, width - 1)
+                img_coords[:, 1] = np.clip(img_coords[:, 1], 0, height - 1)
+                
+                # Sample colors from image
+                colors = np.zeros((len(vertices), 4), dtype=np.uint8)
+                for i, (x, y) in enumerate(img_coords):
+                    colors[i] = img_array[y, x]
+                
+                # Apply colors to mesh
+                textured_mesh.visual.vertex_colors = colors
+                logger.info("Applied vertex colors to mesh")
+            except Exception as e:
+                logger.error(f"Error creating colored mesh: {e}")
+                # Last resort - just use the untextured mesh
+                textured_mesh = mesh
+    
     except Exception as e:
         logger.error(f"Error generating texture: {e}")
         import traceback
@@ -738,20 +832,24 @@ if __name__ == '__main__':
         try:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            if args.low_vram_mode:
-                texgen_worker.enable_model_cpu_offload()
+            # Explicitly use the Paint subfolder for texture generation
+            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(
+                args.texgen_model_path,
+                subfolder="hunyuan3d-paint-v2-0"  # Explicitly use the Paint model
+            )
             
-            # Add this debug print to see what methods are available
+            # Debug info to see what methods are available
             print("Available texgen methods:", [m for m in dir(texgen_worker) if not m.startswith('_')])
             if hasattr(texgen_worker, 'render'):
                 print("Render object type:", type(texgen_worker.render))
                 print("Render methods:", [m for m in dir(texgen_worker.render) if not m.startswith('_')])
-            
-            # Try to find the method that should be used for texturing
+                
             if hasattr(texgen_worker, 'models'):
                 print("Available models:", list(texgen_worker.models.keys()))
-            
+                
+            if args.low_vram_mode:
+                texgen_worker.enable_model_cpu_offload()
+                
             HAS_TEXTUREGEN = True
         except Exception as e:
             print(e)
