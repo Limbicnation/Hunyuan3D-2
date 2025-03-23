@@ -272,19 +272,63 @@ def generation_all(
     )
     path = export_mesh(mesh, save_folder, textured=False)
 
-    # tmp_time = time.time()
-    # mesh = floater_remove_worker(mesh)
-    # mesh = degenerate_face_remove_worker(mesh)
-    # logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
-    # stats['time']['postprocessing'] = time.time() - tmp_time
-
     tmp_time = time.time()
     mesh = face_reduce_worker(mesh)
     logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['face reduction'] = time.time() - tmp_time
 
+    # Modified texture generation code
     tmp_time = time.time()
-    textured_mesh = texgen_worker(mesh, image)
+    try:
+        # Try different approaches to generate texture
+        render_obj = texgen_worker.render
+        render_methods = [m for m in dir(render_obj) if not m.startswith('_')]
+        logger.info(f"Available methods on render object: {render_methods}")
+        
+        # Check if we have models that might help
+        if hasattr(texgen_worker, 'models'):
+            for model_name, model in texgen_worker.models.items():
+                if hasattr(model, 'process') and callable(getattr(model, 'process')):
+                    logger.info(f"Using {model_name}.process for texturing")
+                    textured_mesh = model.process(mesh, image)
+                    break
+                elif hasattr(model, 'apply_texture') and callable(getattr(model, 'apply_texture')):
+                    logger.info(f"Using {model_name}.apply_texture for texturing")
+                    textured_mesh = model.apply_texture(mesh, image)
+                    break
+                elif hasattr(model, '__call__') and callable(getattr(model, '__call__')):
+                    logger.info(f"Calling {model_name} directly for texturing")
+                    textured_mesh = model(mesh, image)
+                    break
+            else:
+                # No suitable model method found, try the render attribute
+                for method_name in ['apply', 'process', 'generate', 'texture', 'render_texture']:
+                    if hasattr(render_obj, method_name) and callable(getattr(render_obj, method_name)):
+                        logger.info(f"Using render.{method_name} for texturing")
+                        textured_mesh = getattr(render_obj, method_name)(mesh, image)
+                        break
+                else:
+                    # As a last resort, check if there's a method directly on texgen_worker
+                    for method_name in ['render_texture', 'apply_texture', 'generate_texture']:
+                        if hasattr(texgen_worker, method_name) and callable(getattr(texgen_worker, method_name)):
+                            logger.info(f"Using texgen_worker.{method_name} for texturing")
+                            textured_mesh = getattr(texgen_worker, method_name)(mesh, image)
+                            break
+                    else:
+                        # Try the default method last
+                        logger.info("Trying default texgen_worker call")
+                        textured_mesh = texgen_worker(mesh, image)
+        else:
+            # If no models, try calling texgen_worker directly
+            logger.info("No models attribute, calling texgen_worker directly")
+            textured_mesh = texgen_worker(mesh, image)
+            
+    except Exception as e:
+        logger.error(f"Error generating texture: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        textured_mesh = mesh  # Use untextured mesh as fallback
+        
     logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
     stats['time']['texture generation'] = time.time() - tmp_time
     stats['time']['total'] = time.time() - start_time_0
@@ -697,12 +741,17 @@ if __name__ == '__main__':
             texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
             if args.low_vram_mode:
                 texgen_worker.enable_model_cpu_offload()
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
+            
+            # Add this debug print to see what methods are available
+            print("Available texgen methods:", [m for m in dir(texgen_worker) if not m.startswith('_')])
+            if hasattr(texgen_worker, 'render'):
+                print("Render object type:", type(texgen_worker.render))
+                print("Render methods:", [m for m in dir(texgen_worker.render) if not m.startswith('_')])
+            
+            # Try to find the method that should be used for texturing
+            if hasattr(texgen_worker, 'models'):
+                print("Available models:", list(texgen_worker.models.keys()))
+            
             HAS_TEXTUREGEN = True
         except Exception as e:
             print(e)
