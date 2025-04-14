@@ -29,7 +29,8 @@ meshlib==3.0.4.121
 
 # Training
 accelerate
-#pytorch_lightning
+lightning-utilities>=0.10.0
+pytorch-lightning>=2.0.0
 #scikit-learn
 #scikit-image
 
