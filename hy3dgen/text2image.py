@@ -34,12 +34,35 @@ class HunyuanDiTPipeline:
         device='cuda'
     ):
         self.device = device
-        self.pipe = AutoPipelineForText2Image.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            enable_pag=True,
-            pag_applied_layers=["blocks.(16|17|18|19)"]
-        ).to(device)
+        
+        try:
+            # Check if sentencepiece is available
+            import importlib
+            sentencepiece_spec = importlib.util.find_spec("sentencepiece")
+            if sentencepiece_spec is None:
+                print("\n" + "="*80)
+                print("ERROR: SentencePiece library is required but not installed.")
+                print("Please install it with: pip install sentencepiece")
+                print("You may need to restart your environment after installation.")
+                print("="*80 + "\n")
+                raise ImportError("SentencePiece is required but not installed")
+                
+            print(f"Loading text-to-image model from: {model_path}")
+            self.pipe = AutoPipelineForText2Image.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                enable_pag=True,
+                pag_applied_layers=["blocks.(16|17|18|19)"],
+                local_files_only=os.path.exists(model_path) and not model_path.startswith("Tencent-Hunyuan/")
+            ).to(device)
+            print("Successfully loaded text-to-image model")
+        except Exception as e:
+            print(f"\nError loading text-to-image model: {str(e)}")
+            print("\nIf you're seeing an error about SentencePiece, install it with:")
+            print("pip install sentencepiece")
+            print("\nIf you're having other issues, try downloading the model directly:")
+            print("python download_models.py --t2i")
+            raise
         self.pos_txt = ",白色背景,3D风格,最佳质量"
         self.neg_txt = "文本,特写,裁剪,出框,最差质量,低质量,JPEG伪影,PGLY,重复,病态," \
                        "残缺,多余的手指,变异的手,画得不好的手,画得不好的脸,变异,畸形,模糊,脱水,糟糕的解剖学," \

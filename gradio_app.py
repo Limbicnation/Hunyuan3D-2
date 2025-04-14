@@ -483,17 +483,27 @@ def build_app():
                             min_width=100,
                         )
                         with gr.Row():
+                            # Reduce default inference steps to save memory
+                            default_steps = 2 if args.extreme_low_mem else (5 if 'turbo' in args.subfolder else 30)
                             num_steps = gr.Slider(maximum=100,
                                                   minimum=1,
-                                                  value=5 if 'turbo' in args.subfolder else 30,
+                                                  value=default_steps,
                                                   step=1, label='Inference Steps')
-                            octree_resolution = gr.Slider(maximum=512, minimum=16, value=256, label='Octree Resolution')
+                                                  
+                            # Reduce default resolution to save memory
+                            default_res = 192 if args.extreme_low_mem else 256
+                            octree_resolution = gr.Slider(maximum=512, minimum=16, value=default_res, label='Octree Resolution')
                         with gr.Row():
                             cfg_scale = gr.Number(value=5.0, label='Guidance Scale', min_width=100)
-                            num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=8000,
+                            
+                            # Reduce default chunks to save memory
+                            default_chunks = 2000 if args.extreme_low_mem else 8000
+                            num_chunks = gr.Slider(maximum=5000000, minimum=1000, value=default_chunks,
                                                    label='Number of Chunks', min_width=100)
                         with gr.Row():
-                            texture_size = gr.Slider(minimum=1024, maximum=4096, step=1024, value=2048,
+                            # Use lower texture resolution for low memory mode
+                            default_tex_size = 1024 if args.extreme_low_mem else 2048
+                            texture_size = gr.Slider(minimum=512, maximum=4096, step=512, value=default_tex_size,
                                                      label='Texture Resolution')
                             enhance_texture = gr.Checkbox(label='Enhance Texture Angles', value=False)
                             pbr = gr.Checkbox(label='PBR Texture (Experimental, use the README in folder)', value=False)
@@ -700,9 +710,13 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, default='tencent/Hunyuan3D-2mini')
-    parser.add_argument("--subfolder", type=str, default='hunyuan3d-dit-v2-mini-turbo')
+    # Set correct paths to the models in your local directory
+    parser.add_argument("--model_path", type=str, default='tencent/Hunyuan3D-2')
+    parser.add_argument("--subfolder", type=str, default='hunyuan3d-dit-v2-0-turbo')
     parser.add_argument("--texgen_model_path", type=str, default='tencent/Hunyuan3D-2')
+    
+    # Set the environment variable for HuggingFace to find models in your local directory
+    os.environ['HY3DGEN_MODELS'] = '/home/gero/GitHub/Hunyuan3D-2/models'
     parser.add_argument('--port', type=int, default=8080)
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--device', type=str, default='cuda')
@@ -713,6 +727,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument('--extreme_low_mem', action='store_true', help='Enable extreme memory saving techniques including 8-bit quantization')
     parser.add_argument('--use_delight', action='store_true', help='Use Delight model', default=False)
     parser.add_argument('--mv_model', type=str, default='hunyuan3d-paint-v2-0', help='Multiview model to use')
     args = parser.parse_args()
@@ -751,50 +766,155 @@ if __name__ == '__main__':
         try:
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path, mv_model=args.mv_model,
-                                                                   use_delight=args.use_delight)
-            if args.low_vram_mode:
+            texgen_kwargs = {}
+            if args.extreme_low_mem:
+                print("Applying extreme low memory settings to texture generator")
+                # Add 8-bit quantization if available
+                try:
+                    import bitsandbytes
+                    texgen_kwargs["load_in_8bit"] = True 
+                    texgen_kwargs["device_map"] = "auto"
+                except ImportError:
+                    pass
+
+            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(
+                args.texgen_model_path, 
+                mv_model=args.mv_model,
+                use_delight=args.use_delight,
+                **texgen_kwargs
+            )
+            
+            # Apply memory optimizations
+            if args.low_vram_mode or args.extreme_low_mem:
+                print("Applying memory optimizations to texture generator")
                 texgen_worker.enable_model_cpu_offload()
+                
                 if 'hunyuan3d-paint' in args.mv_model:
-                    texgen_worker.models["multiview_model"].pipeline.vae.use_slicing = True
-                    texgen_worker.models["multiview_model"].pipeline.enable_attention_slicing()
-                    texgen_worker.models["multiview_model"].pipeline.enable_vae_slicing()
-                    texgen_worker.models["multiview_model"].pipeline.enable_vae_tiling()
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
+                    # Apply all possible memory optimizations
+                    if hasattr(texgen_worker.models, "multiview_model"):
+                        if hasattr(texgen_worker.models["multiview_model"], "pipeline"):
+                            pipeline = texgen_worker.models["multiview_model"].pipeline
+                            
+                            # VAE optimizations
+                            if hasattr(pipeline, "vae"):
+                                pipeline.vae.use_slicing = True
+                            
+                            # Enable all slicing and tiling options
+                            for method in ["enable_attention_slicing", "enable_vae_slicing", 
+                                          "enable_vae_tiling", "enable_sequential_cpu_offload"]:
+                                if hasattr(pipeline, method):
+                                    getattr(pipeline, method)()
+                
+                # Free memory after optimizations
+                torch.cuda.empty_cache()
+                
             HAS_TEXTUREGEN = True
         except Exception as e:
-            print(e)
+            print("=" * 80)
+            print(f"ERROR loading texture generator: {str(e)}")
             print("Failed to load texture generator.")
             print('Please try to install requirements by following README.md')
+            print("Or try running with --disable_tex --extreme_low_mem flags")
+            print("=" * 80)
             HAS_TEXTUREGEN = False
 
-    HAS_T2I = True
+    HAS_T2I = False
     if args.enable_t23d:
-        from hy3dgen.text2image import HunyuanDiTPipeline
+        try:
+            from hy3dgen.text2image import HunyuanDiTPipeline
 
-        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device)
-        HAS_T2I = True
+            # Check if we have a local version of the T2I model
+            local_t2i_path = '/home/gero/GitHub/Hunyuan3D-2/models/Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled'
+            
+            if os.path.exists(local_t2i_path):
+                print(f"Using local text-to-image model from: {local_t2i_path}")
+                t2i_model_path = local_t2i_path
+                # Override huggingface cache to use our local directory
+                os.environ['HUGGINGFACE_HUB_CACHE'] = '/home/gero/GitHub/Hunyuan3D-2/models'
+            else:
+                print("Local T2I model not found. To download it, run:")
+                print("python download_models.py --t2i")
+                print("Using remote model instead (will be downloaded)...")
+                t2i_model_path = 'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled'
+                
+            try:    
+                t2i_worker = HunyuanDiTPipeline(t2i_model_path, device=args.device)
+                HAS_T2I = True
+            except ImportError as e:
+                if "SentencePiece" in str(e):
+                    print("\n" + "="*80)
+                    print("ERROR: SentencePiece library is required for text-to-image generation.")
+                    print("Please install it with: pip install sentencepiece")
+                    print("Then restart the application.")
+                    print("="*80 + "\n")
+                    HAS_T2I = False
+                else:
+                    raise
+        except Exception as e:
+            print(f"Error initializing text-to-image pipeline: {e}")
+            print("Text-to-image functionality will be disabled.")
+            HAS_T2I = False
 
     from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, Hunyuan3DDiTFlowMatchingPipeline
     from hy3dgen.shapegen.pipelines import export_to_trimesh
     from hy3dgen.rembg import BackgroundRemover
 
     rmbg_worker = BackgroundRemover()
+    
+    # Apply memory optimization techniques
+    torch_dtype = torch.float16  # Default to half precision
+    kwargs = {}
+    
+    if args.extreme_low_mem:
+        print("\n" + "="*80)
+        print("EXTREME LOW MEMORY MODE ENABLED")
+        print("Using 8-bit quantization for models")
+        print("This will reduce memory usage significantly but may affect quality")
+        print("="*80 + "\n")
+        
+        try:
+            from bitsandbytes.nn import Linear8bitLt
+            import transformers
+            
+            # Add 8-bit loading options
+            kwargs["load_in_8bit"] = True
+            kwargs["device_map"] = "auto"
+            torch_dtype = torch.float32  # Use float32 when loading in 8-bit
+        except ImportError:
+            print("Warning: bitsandbytes not installed. Install with: pip install bitsandbytes transformers>=4.30.0")
+            print("Falling back to regular low memory mode")
+            args.low_vram_mode = True
+    
+    # Load model with appropriate options
     i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
         args.model_path,
         subfolder=args.subfolder,
         use_safetensors=True,
         device=args.device,
+        dtype=torch_dtype,
+        **kwargs
     )
+    
+    # Enable additional memory-saving features
+    if args.low_vram_mode or args.extreme_low_mem:
+        print("Low VRAM mode enabled - applying memory optimizations")
+        torch.cuda.empty_cache()
+        if hasattr(i23d_worker, 'enable_model_cpu_offload'):
+            i23d_worker.enable_model_cpu_offload()
+        
+        if hasattr(i23d_worker, 'vae'):
+            if hasattr(i23d_worker.vae, 'enable_slicing'):
+                i23d_worker.vae.enable_slicing()
+            
+            # Reduce batch size and chunk size for inference
+            if hasattr(i23d_worker.vae, 'decoder') and hasattr(i23d_worker.vae.decoder, 'slicing_size'):
+                i23d_worker.vae.decoder.slicing_size = 1
+    
     if args.enable_flashvdm:
         mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
         i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
+    
+    if args.compile and not args.extreme_low_mem:  # Don't compile when using 8-bit quantization
         i23d_worker.compile()
 
     floater_remove_worker = FloaterRemover()
