@@ -9,10 +9,52 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
-from xformers.ops import SwiGLU
+
+# Try to import flash_attn, but provide fallback if not available
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    print("WARNING: flash_attn not available. Using standard attention instead.")
+    print("For better performance, install flash-attn with: pip install flash-attn")
+    def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False):
+        # Simple fallback implementation using standard attention
+        q = q.transpose(1, 2)  # [batch, seq_len, heads, dim] -> [batch, heads, seq_len, dim]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Standard scaled dot-product attention
+        scale = 1.0 / math.sqrt(q.size(-1)) if softmax_scale is None else softmax_scale
+        scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+        
+        if causal:
+            # Apply causal mask
+            seq_len = q.size(-2)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1)
+            scores = scores.masked_fill(causal_mask.bool().unsqueeze(0).unsqueeze(0), -1e9)
+        
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+        return out.transpose(1, 2)  # [batch, heads, seq_len, dim] -> [batch, seq_len, heads, dim]
+
+try:
+    from xformers.ops import SwiGLU
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
+    print("WARNING: xformers not available. Using standard SwiGLU implementation.")
+    # Fallback implementation of SwiGLU
+    class SwiGLU(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.w = nn.Linear(dim, 2 * dim)
+            
+        def forward(self, x):
+            x1, x2 = self.w(x).chunk(2, dim=-1)
+            return x1 * F.silu(x2)
 
 from .config import Config
 from .fused_rotary_embedding import apply_rotary_emb_func
@@ -484,13 +526,13 @@ class CausalSelfAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.config.head_size)
 
         if (
-                FlashAttention2Available
+                FLASH_ATTN_AVAILABLE
+                and FlashAttention2Available
                 and mask is None
                 and q.device.type == "cuda"
                 and q.dtype in (torch.float16, torch.bfloat16)
         ):
-            from flash_attn import flash_attn_func
-
+            # Flash attention is available and conditions are right for using it
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
