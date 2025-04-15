@@ -309,23 +309,66 @@ def generation_all(
     path = export_mesh(mesh, save_folder, textured=False)
 
     tmp_time = time.time()
-    textured_mesh = texgen_worker(
-        mesh,
-        original_images,
-        upscale_model=upscale_model,
-        enhance_texture_angles=enhance_texture_angles,
-        pbr=pbr,
-        texture_size=texture_size,
-        unwrap_method=uv_unwrap_method
-    )
-    logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['texture generation'] = time.time() - tmp_time
-    stats['time']['total'] = time.time() - start_time_0
+    
+    # Clear memory before texturing
+    torch.cuda.empty_cache()
+    
+    # Use lower texture quality settings in extreme low memory mode
+    if args.extreme_low_mem:
+        print("Using reduced texture size to avoid OOM")
+        texture_size = min(texture_size, 1024)  # Limit texture size
+        enhance_texture_angles = False          # Disable angle enhancement to save memory
+        
+        # Only print warning if user selected an upscaler
+        if upscale_model != 'None':
+            print("WARNING: Disabling upscaling in extreme low memory mode")
+        upscale_model = 'None'                 # Disable upscaling
+    
+    try:
+        # Generate texture with memory optimization
+        textured_mesh = texgen_worker(
+            mesh,
+            original_images,
+            upscale_model=upscale_model,
+            enhance_texture_angles=enhance_texture_angles,
+            pbr=pbr,
+            texture_size=texture_size,
+            unwrap_method=uv_unwrap_method
+        )
+        logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
+        stats['time']['texture generation'] = time.time() - tmp_time
+        stats['time']['total'] = time.time() - start_time_0
 
-    textured_mesh.metadata['extras'] = stats
-    path_textured = export_mesh(textured_mesh, save_folder, textured=True)
-    model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                         textured=True)
+        textured_mesh.metadata['extras'] = stats
+        path_textured = export_mesh(textured_mesh, save_folder, textured=True)
+        model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
+                                                            textured=True)
+    except RuntimeError as e:
+        if 'CUDA out of memory' in str(e):
+            # Recover from OOM error and provide a useful message
+            torch.cuda.empty_cache()
+            print("\n" + "="*80)
+            print("ERROR: Out of memory during texture generation.")
+            print("Try using --extreme_low_mem flag or reduce the texture size.")
+            print("Using vertex coloring as fallback.")
+            print("="*80 + "\n")
+            
+            # Try vertex coloring as fallback (much lower memory usage)
+            try:
+                from hy3dgen.texgen.vertex_coloring import apply_vertex_colors
+                textured_mesh = apply_vertex_colors(mesh, original_images[0])
+            except Exception as vc_error:
+                print(f"Error during vertex coloring: {vc_error}")
+                textured_mesh = mesh  # Just use untextured mesh as last resort
+                
+            path_textured = export_mesh(textured_mesh, save_folder, textured=True)
+            model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
+                                                                textured=True)
+        else:
+            # Re-raise other errors
+            raise
+            
+    # Make sure to clean up at the end
     torch.cuda.empty_cache()
 
     return (
